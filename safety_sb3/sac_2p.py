@@ -34,6 +34,7 @@ full comparison and for why there is deliberately no shared
 from __future__ import annotations
 
 import copy
+import math
 
 import numpy as np
 import torch as th
@@ -86,8 +87,23 @@ class AbstractSAC2P(AbstractSAC):
     leaderboard_freq: int = 10_000,
     n_eval_episodes: int = 10,
     leaderboard_dir: str = "sac_2p_leaderboard",
+    # --- disturbance exploration ---
+    # dstb_min_alpha: the dstb entropy temperature's own floor. None -> the
+    # shared ``min_alpha``; <= 0 -> no floor; > 0 -> that floor. The dstb Q
+    # slope can sit far below the shared floor, letting entropy swamp it.
+    # dstb_alpha_reset: whether a gamma jump resets the dstb temperature to its
+    # init value (the ctrl temperature is always reset).
+    # league_deterministic: roll out an ARCHIVED league dstb at its
+    # deterministic action (as the league scores it) instead of sampling it.
+    # The current dstb is always sampled, for exploration.
+    dstb_min_alpha: float | None = None,
+    dstb_alpha_reset: bool = True,
+    league_deterministic: bool = False,
     **kwargs,
   ) -> None:
+    self._dstb_min_alpha_arg = None if dstb_min_alpha is None else float(dstb_min_alpha)
+    self.dstb_alpha_reset = bool(dstb_alpha_reset)
+    self.league_deterministic = bool(league_deterministic)
     self.ctrl_action_dim = None if ctrl_action_dim is None else int(ctrl_action_dim)
     self.ctrl_update_period = int(ctrl_update_period)
     self.dstb_update_period = int(dstb_update_period)
@@ -163,6 +179,15 @@ class AbstractSAC2P(AbstractSAC):
       )
     else:
       self.dstb_ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
+
+    # The dstb temperature's floor in log space (the shared ceiling still
+    # applies). None arg -> the shared floor set by _setup_entropy_bounds.
+    if self._dstb_min_alpha_arg is None:
+      self._dstb_log_min_alpha = self._log_min_alpha
+    elif self._dstb_min_alpha_arg <= 0:
+      self._dstb_log_min_alpha = None
+    else:
+      self._dstb_log_min_alpha = math.log(self._dstb_min_alpha_arg)
 
     # Snapshot the dstb init entropy temperature so a gamma jump can reset it
     # too (the ctrl init is snapshotted in AbstractSAC._setup_entropy_bounds).
@@ -268,12 +293,13 @@ class AbstractSAC2P(AbstractSAC):
       scaled = self.policy.scale_action(unscaled)
     else:
       obs_tensor, _ = self.policy.obs_to_tensor(self._last_obs)
-      dstb_net = (
-        self._rollout_dstb if self._rollout_dstb is not None else self.policy.dstb_actor
-      )
+      archived = self._rollout_dstb is not None
+      dstb_net = self._rollout_dstb if archived else self.policy.dstb_actor
+      # an archived league dstb plays its deterministic action when asked
+      dstb_det = archived and self.league_deterministic
       with th.no_grad():
         ctrl = self.policy.actor(obs_tensor, deterministic=False)
-        dstb = dstb_net(obs_tensor, deterministic=False)
+        dstb = dstb_net(obs_tensor, deterministic=dstb_det)
       scaled = th.cat([ctrl, dstb], dim=1).cpu().numpy()  # actors output in [-1, 1]
 
     if action_noise is not None:
@@ -291,28 +317,30 @@ class AbstractSAC2P(AbstractSAC):
     is the league-sampled opponent when active, else the current dstb actor
     (mirrors the numpy path). Actors output in [-1, 1] and the env action space
     is [-1, 1], so no unscaling is needed — the collect loop clamps to bounds.
+    With ``league_deterministic`` an archived league dstb plays its
+    deterministic action, as the league scores it.
     """
-    dstb_net = (
-      self._rollout_dstb if getattr(self, "_rollout_dstb", None) is not None
-      else self.policy.dstb_actor
-    )
+    archived = getattr(self, "_rollout_dstb", None) is not None
+    dstb_net = self._rollout_dstb if archived else self.policy.dstb_actor
+    dstb_det = archived and self.league_deterministic
     with th.no_grad():
       ctrl = self.policy.actor(obs, deterministic=False)
-      dstb = dstb_net(obs, deterministic=False)
+      dstb = dstb_net(obs, deterministic=dstb_det)
     return th.cat([ctrl, dstb], dim=1)
 
   # --- entropy-coefficient helper ---
-  def _alpha(self, log_coef, optimizer, coef_tensor, target_entropy, log_prob):
+  def _alpha(self, log_coef, optimizer, coef_tensor, target_entropy, log_prob,
+             log_min_alpha):
     if log_coef is not None and optimizer is not None:
       coef = th.exp(log_coef.detach())
       loss = -(log_coef * (log_prob + target_entropy).detach()).mean()
       optimizer.zero_grad()
       loss.backward()
       optimizer.step()
-      # min_alpha/max_alpha floor/ceiling -- both actors share bounds.
-      if self._log_min_alpha is not None or self._log_max_alpha is not None:
+      # per-actor floor (log_min_alpha), shared ceiling
+      if log_min_alpha is not None or self._log_max_alpha is not None:
         with th.no_grad():
-          log_coef.clamp_(min=self._log_min_alpha, max=self._log_max_alpha)
+          log_coef.clamp_(min=log_min_alpha, max=self._log_max_alpha)
     else:
       coef = coef_tensor
     return coef
@@ -321,6 +349,9 @@ class AbstractSAC2P(AbstractSAC):
     """A gamma jump resets BOTH actors' entropy temperature (reference resets
     ctrl AND dstb alpha on every jump)."""
     super()._reset_entropy_temp()  # ctrl
+    # dstb_alpha_reset=False keeps the dstb temperature across gamma jumps
+    if not getattr(self, "dstb_alpha_reset", True):
+      return
     dlec = getattr(self, "dstb_log_ent_coef", None)
     if dlec is None or getattr(self, "_init_dstb_log_ent_coef", None) is None:
       return
@@ -393,6 +424,7 @@ class AbstractSAC2P(AbstractSAC):
     critic_loss_sum, ctrl_loss_sum, dstb_loss_sum = _z.clone(), _z.clone(), _z.clone()
     critic_loss_max = th.full((), -float("inf"), device=self.device)
     n_critic = n_ctrl = n_dstb = 0
+    dstb_cos = None
     for step in range(gradient_steps):
       rd = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
@@ -403,11 +435,12 @@ class AbstractSAC2P(AbstractSAC):
 
       ctrl_ent = self._alpha(
         self.log_ent_coef, self.ent_coef_optimizer, self.ent_coef_tensor,
-        self.target_entropy, ctrl_logp,
+        self.target_entropy, ctrl_logp, self._log_min_alpha,
       )
       dstb_ent = self._alpha(
         self.dstb_log_ent_coef, self.dstb_ent_coef_optimizer,
         self.dstb_ent_coef_tensor, self.dstb_target_entropy, dstb_logp,
+        self._dstb_log_min_alpha,
       )
 
       # --- critic update (soft max-min next value) ---
@@ -466,6 +499,16 @@ class AbstractSAC2P(AbstractSAC):
         dstb_loss.backward()
         self.dstb_actor.optimizer.step()
 
+      # how well a sampled dstb action agrees in direction with the
+      # deterministic one (last gradient step only). Near 0 means exploration
+      # noise swamps the mean, so training plays near-random disturbances.
+      if step == gradient_steps - 1:
+        with th.no_grad():
+          dstb_mean = self.dstb_actor(rd.observations, deterministic=True)
+          dstb_sample = dstb_pi.detach()
+          norms = (dstb_sample.norm(dim=1) * dstb_mean.norm(dim=1)).clamp_min(1e-8)
+          dstb_cos = ((dstb_sample * dstb_mean).sum(dim=1) / norms).mean()
+
       if step % self.target_update_interval == 0:
         self._polyak(
           self.critic.parameters(), self.critic_target.parameters(), self.tau
@@ -486,6 +529,8 @@ class AbstractSAC2P(AbstractSAC):
     # last step's values.
     self.logger.record("train/ent_coef_ctrl", float(ctrl_ent.mean()))
     self.logger.record("train/ent_coef_dstb", float(dstb_ent.mean()))
+    if dstb_cos is not None:
+      self.logger.record("train/dstb_sample_cos", float(dstb_cos))
     self.logger.record("train/gamma", float(self.gamma))
 
   def _excluded_save_params(self):
