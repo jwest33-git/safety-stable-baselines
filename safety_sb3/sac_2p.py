@@ -102,12 +102,23 @@ class AbstractSAC2P(AbstractSAC):
     dstb_alpha_reset: bool = True,
     league_deterministic: bool = False,
     dstb_target_entropy: float | None = None,
+    # --- control exploration (same meaning as the dstb options above) ---
+    # ctrl_min_alpha: the ctrl temperature's own floor (None -> shared
+    # min_alpha, <= 0 -> none). ctrl_alpha_reset: whether a gamma jump resets
+    # it. ctrl_target_entropy: its tuning target (None -> -ctrl_action_dim).
+    ctrl_min_alpha: float | None = None,
+    ctrl_alpha_reset: bool = True,
+    ctrl_target_entropy: float | None = None,
     **kwargs,
   ) -> None:
     self._dstb_min_alpha_arg = None if dstb_min_alpha is None else float(dstb_min_alpha)
     self._dstb_target_entropy_arg = (
       None if dstb_target_entropy is None else float(dstb_target_entropy))
     self.dstb_alpha_reset = bool(dstb_alpha_reset)
+    self._ctrl_min_alpha_arg = None if ctrl_min_alpha is None else float(ctrl_min_alpha)
+    self._ctrl_target_entropy_arg = (
+      None if ctrl_target_entropy is None else float(ctrl_target_entropy))
+    self.ctrl_alpha_reset = bool(ctrl_alpha_reset)
     self.league_deterministic = bool(league_deterministic)
     self.ctrl_action_dim = None if ctrl_action_dim is None else int(ctrl_action_dim)
     self.ctrl_update_period = int(ctrl_update_period)
@@ -165,7 +176,12 @@ class AbstractSAC2P(AbstractSAC):
     dstb_dim = self.policy.dstb_action_dim
 
     # Per-actor target entropies (SB3 set ctrl to -full_dim).
-    self.target_entropy = float(-self.ctrl_action_dim)
+    # ctrl: -ctrl_action_dim unless ctrl_target_entropy was given
+    ctrl_target_arg = getattr(self, "_ctrl_target_entropy_arg", None)
+    if ctrl_target_arg is None:
+      self.target_entropy = float(-self.ctrl_action_dim)
+    else:
+      self.target_entropy = ctrl_target_arg
     # dstb: -dstb_dim unless dstb_target_entropy was given
     target_arg = getattr(self, "_dstb_target_entropy_arg", None)
     self.dstb_target_entropy = float(-dstb_dim) if target_arg is None else target_arg
@@ -195,6 +211,14 @@ class AbstractSAC2P(AbstractSAC):
       self._dstb_log_min_alpha = None
     else:
       self._dstb_log_min_alpha = math.log(self._dstb_min_alpha_arg)
+    # the ctrl temperature's floor, resolved the same way
+    ctrl_min_arg = getattr(self, "_ctrl_min_alpha_arg", None)
+    if ctrl_min_arg is None:
+      self._ctrl_log_min_alpha = self._log_min_alpha
+    elif ctrl_min_arg <= 0:
+      self._ctrl_log_min_alpha = None
+    else:
+      self._ctrl_log_min_alpha = math.log(ctrl_min_arg)
 
     # Snapshot the dstb init entropy temperature so a gamma jump can reset it
     # too (the ctrl init is snapshotted in AbstractSAC._setup_entropy_bounds).
@@ -354,8 +378,10 @@ class AbstractSAC2P(AbstractSAC):
 
   def _reset_entropy_temp(self) -> None:
     """A gamma jump resets BOTH actors' entropy temperature (reference resets
-    ctrl AND dstb alpha on every jump)."""
-    super()._reset_entropy_temp()  # ctrl
+    ctrl AND dstb alpha on every jump). ctrl_alpha_reset / dstb_alpha_reset
+    =False keep that actor's temperature across the jump."""
+    if getattr(self, "ctrl_alpha_reset", True):
+      super()._reset_entropy_temp()  # ctrl
     # dstb_alpha_reset=False keeps the dstb temperature across gamma jumps
     if not getattr(self, "dstb_alpha_reset", True):
       return
@@ -432,6 +458,7 @@ class AbstractSAC2P(AbstractSAC):
     critic_loss_max = th.full((), -float("inf"), device=self.device)
     n_critic = n_ctrl = n_dstb = 0
     dstb_cos = None
+    ctrl_cos = None
     for step in range(gradient_steps):
       rd = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
@@ -442,7 +469,7 @@ class AbstractSAC2P(AbstractSAC):
 
       ctrl_ent = self._alpha(
         self.log_ent_coef, self.ent_coef_optimizer, self.ent_coef_tensor,
-        self.target_entropy, ctrl_logp, self._log_min_alpha,
+        self.target_entropy, ctrl_logp, self._ctrl_log_min_alpha,
       )
       dstb_ent = self._alpha(
         self.dstb_log_ent_coef, self.dstb_ent_coef_optimizer,
@@ -515,6 +542,11 @@ class AbstractSAC2P(AbstractSAC):
           dstb_sample = dstb_pi.detach()
           norms = (dstb_sample.norm(dim=1) * dstb_mean.norm(dim=1)).clamp_min(1e-8)
           dstb_cos = ((dstb_sample * dstb_mean).sum(dim=1) / norms).mean()
+          # the same agreement for the ctrl action vector
+          ctrl_mean = self.actor(rd.observations, deterministic=True)
+          ctrl_sample = ctrl_pi.detach()
+          norms = (ctrl_sample.norm(dim=1) * ctrl_mean.norm(dim=1)).clamp_min(1e-8)
+          ctrl_cos = ((ctrl_sample * ctrl_mean).sum(dim=1) / norms).mean()
 
       if step % self.target_update_interval == 0:
         self._polyak(
@@ -538,6 +570,7 @@ class AbstractSAC2P(AbstractSAC):
     self.logger.record("train/ent_coef_dstb", float(dstb_ent.mean()))
     if dstb_cos is not None:
       self.logger.record("train/dstb_sample_cos", float(dstb_cos))
+      self.logger.record("train/ctrl_sample_cos", float(ctrl_cos))
     self.logger.record("train/gamma", float(self.gamma))
 
   def _excluded_save_params(self):

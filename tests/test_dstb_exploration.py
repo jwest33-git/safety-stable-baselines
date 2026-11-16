@@ -2,7 +2,9 @@
 ``dstb_min_alpha`` (the dstb temperature's own floor), ``dstb_alpha_reset``
 (whether a gamma jump resets it), ``league_deterministic`` (archived league
 dstb played at its deterministic action), ``dstb_target_entropy`` (the dstb
-temperature's tuning target) and the ``train/dstb_sample_cos`` metric. CPU
+temperature's tuning target) and the ``train/dstb_sample_cos`` metric, plus
+the matching ctrl options (``ctrl_min_alpha``, ``ctrl_alpha_reset``,
+``ctrl_target_entropy``, ``train/ctrl_sample_cos``). CPU
 only, on the two-player double integrator.
 
   python tests/test_dstb_exploration.py
@@ -137,6 +139,61 @@ def test_dstb_sample_cos_logged():
   print(f"[ok] train/dstb_sample_cos logged: {cos:+.3f}")
 
 
+def test_ctrl_min_alpha():
+  # its own, lower floor: the ctrl clamps there, the dstb keeps 1e-3
+  ctrl, dstb = _alphas_after_push_down(_model(ctrl_min_alpha=1e-6))
+  assert 1e-6 * 0.999 <= ctrl < 1e-4, ctrl
+  assert dstb >= 1e-3 * 0.999, dstb
+  # <= 0: no ctrl floor at all
+  ctrl, dstb = _alphas_after_push_down(_model(ctrl_min_alpha=0.0))
+  assert ctrl < 1e-6, ctrl
+  assert dstb >= 1e-3 * 0.999, dstb
+  print("[ok] ctrl_min_alpha: own / no floor")
+
+
+def test_ctrl_alpha_reset():
+  for reset in (True, False):
+    model = _model(ctrl_alpha_reset=reset)
+    init_ctrl = float(model._init_log_ent_coef.exp())
+    init_dstb = float(model._init_dstb_log_ent_coef.exp())
+    with th.no_grad():
+      model.log_ent_coef.fill_(math.log(0.005))
+      model.dstb_log_ent_coef.fill_(math.log(0.005))
+    model._reset_entropy_temp()
+    ctrl = float(model.log_ent_coef.detach().exp())
+    dstb = float(model.dstb_log_ent_coef.detach().exp())
+    # the dstb temperature is reset by default
+    assert abs(dstb - init_dstb) < 1e-6, (dstb, init_dstb)
+    if reset:
+      assert abs(ctrl - init_ctrl) < 1e-6, (ctrl, init_ctrl)
+    else:
+      assert abs(ctrl - 0.005) < 1e-6, ctrl
+  print("[ok] ctrl_alpha_reset: reset / kept across a gamma jump")
+
+
+def test_ctrl_target_entropy():
+  # default: -ctrl_action_dim (1 here)
+  assert _model().target_entropy == -1.0
+  moved = {}
+  for target in (20.0, -20.0):
+    model = _model(ctrl_target_entropy=target, ctrl_min_alpha=0.0)
+    assert model.target_entropy == target
+    before = float(model.log_ent_coef.detach())
+    th.manual_seed(0)
+    model.train(gradient_steps=1, batch_size=256)
+    moved[target] = float(model.log_ent_coef.detach()) - before
+  assert moved[20.0] > 0 > moved[-20.0], moved
+  print(f"[ok] ctrl_target_entropy: alpha moves toward the target {moved}")
+
+
+def test_ctrl_sample_cos_logged():
+  model = _model()
+  model.train(gradient_steps=2, batch_size=256)
+  cos = model.logger.name_to_value["train/ctrl_sample_cos"]
+  assert -1.0 <= cos <= 1.0, cos
+  print(f"[ok] train/ctrl_sample_cos logged: {cos:+.3f}")
+
+
 if __name__ == "__main__":
   th.manual_seed(0)
   test_dstb_min_alpha()
@@ -144,4 +201,8 @@ if __name__ == "__main__":
   test_league_deterministic()
   test_dstb_target_entropy()
   test_dstb_sample_cos_logged()
+  test_ctrl_min_alpha()
+  test_ctrl_alpha_reset()
+  test_ctrl_target_entropy()
+  test_ctrl_sample_cos_logged()
   print("ALL DSTB-EXPLORATION TESTS PASSED")
