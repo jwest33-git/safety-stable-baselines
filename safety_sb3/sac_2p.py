@@ -102,12 +102,17 @@ class AbstractSAC2P(AbstractSAC):
     # league_deterministic: roll out an ARCHIVED league dstb at its
     # deterministic action (as the league scores it) instead of sampling it.
     # The current dstb is always sampled, for exploration.
+    # dstb_target_entropy: the entropy the dstb temperature tunes toward.
+    # None -> -dstb_dim. Lower keeps the dstb noise small next to its mean.
     dstb_min_alpha: float | None = None,
     dstb_alpha_reset: bool = True,
     league_deterministic: bool = False,
+    dstb_target_entropy: float | None = None,
     **kwargs,
   ) -> None:
     self._dstb_min_alpha_arg = None if dstb_min_alpha is None else float(dstb_min_alpha)
+    self._dstb_target_entropy_arg = (
+      None if dstb_target_entropy is None else float(dstb_target_entropy))
     self.dstb_alpha_reset = bool(dstb_alpha_reset)
     self.league_deterministic = bool(league_deterministic)
     self.ctrl_action_dim = None if ctrl_action_dim is None else int(ctrl_action_dim)
@@ -167,7 +172,9 @@ class AbstractSAC2P(AbstractSAC):
 
     # Per-actor target entropies (SB3 set ctrl to -full_dim).
     self.target_entropy = float(-self.ctrl_action_dim)
-    self.dstb_target_entropy = float(-dstb_dim)
+    # dstb: -dstb_dim unless dstb_target_entropy was given
+    target_arg = getattr(self, "_dstb_target_entropy_arg", None)
+    self.dstb_target_entropy = float(-dstb_dim) if target_arg is None else target_arg
 
     # Disturbance entropy coefficient (mirror SB3's ctrl setup).
     self.dstb_log_ent_coef = None

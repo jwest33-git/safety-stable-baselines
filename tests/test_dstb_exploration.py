@@ -1,8 +1,9 @@
 """Disturbance-exploration options of the two-player SAC learners:
 ``dstb_min_alpha`` (the dstb temperature's own floor), ``dstb_alpha_reset``
 (whether a gamma jump resets it), ``league_deterministic`` (archived league
-dstb played at its deterministic action) and the ``train/dstb_sample_cos``
-metric. CPU only, on the two-player double integrator.
+dstb played at its deterministic action), ``dstb_target_entropy`` (the dstb
+temperature's tuning target) and the ``train/dstb_sample_cos`` metric. CPU
+only, on the two-player double integrator.
 
   python tests/test_dstb_exploration.py
 """
@@ -111,6 +112,23 @@ def test_league_deterministic():
   print("[ok] league_deterministic: archived dstb deterministic, current sampled")
 
 
+def test_dstb_target_entropy():
+  # default: -dstb_dim (1 here)
+  assert _model().dstb_target_entropy == -1.0
+  # a target above the policy's entropy raises the temperature, one below it
+  # lowers it (same weights and batch, one train step each)
+  moved = {}
+  for target in (20.0, -20.0):
+    model = _model(dstb_target_entropy=target, dstb_min_alpha=0.0)
+    assert model.dstb_target_entropy == target
+    before = float(model.dstb_log_ent_coef.detach())
+    th.manual_seed(0)
+    model.train(gradient_steps=1, batch_size=256)
+    moved[target] = float(model.dstb_log_ent_coef.detach()) - before
+  assert moved[20.0] > 0 > moved[-20.0], moved
+  print(f"[ok] dstb_target_entropy: alpha moves toward the target {moved}")
+
+
 def test_dstb_sample_cos_logged():
   model = _model()
   model.train(gradient_steps=2, batch_size=256)
@@ -124,5 +142,6 @@ if __name__ == "__main__":
   test_dstb_min_alpha()
   test_dstb_alpha_reset()
   test_league_deterministic()
+  test_dstb_target_entropy()
   test_dstb_sample_cos_logged()
   print("ALL DSTB-EXPLORATION TESTS PASSED")
